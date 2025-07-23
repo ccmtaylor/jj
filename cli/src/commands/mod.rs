@@ -222,7 +222,7 @@ pub fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<(), Co
             cmd(ui, command_helper, args)
         }
         Command::Fix(args) => fix::cmd_fix(ui, command_helper, args),
-        Command::Gerrit(sub_args) => gerrit::cmd_gerrit(ui, command_helper, sub_args),
+        Command::Gerrit(args) => gerrit::cmd_gerrit(ui, command_helper, args),
         Command::Git(args) => git::cmd_git(ui, command_helper, args),
         Command::Help(args) => help::cmd_help(ui, command_helper, args),
         Command::Init(args) => init::cmd_init(ui, command_helper, args),

@@ -16,7 +16,7 @@ use std::fmt::Debug;
 use std::io::Write;
 use std::sync::Arc;
 
-use hex::ToHex;
+use bstr::BStr;
 use indexmap::IndexMap;
 use itertools::Itertools as _;
 use jj_lib::commit::Commit;
@@ -26,7 +26,10 @@ use jj_lib::footer::get_footer_lines;
 use jj_lib::footer::FooterEntry;
 use jj_lib::git::GitRefUpdate;
 use jj_lib::git::{self};
+use jj_lib::hex_util::encode_hex;
+use jj_lib::ref_name::GitRefNameBuf;
 use jj_lib::repo::Repo;
+use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 
 use crate::cli_util::short_commit_hash;
@@ -34,9 +37,7 @@ use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
 use crate::command_error::user_error;
 use crate::command_error::CommandError;
-use crate::git_util::get_git_repo;
 use crate::git_util::with_remote_git_callbacks;
-use crate::git_util::GitSidebandProgressMessageWriter;
 use crate::ui::Ui;
 
 #[derive(clap::Args, Clone, Debug)]
@@ -73,15 +74,15 @@ pub struct SendArgs {
 /// 5. otherwise, bail out
 fn calculate_push_remote(
     store: &Arc<Store>,
-    config: &config::Config,
+    config: &UserSettings,
     remote: Option<String>,
 ) -> Result<String, CommandError> {
-    let git_repo = get_git_repo(store)?; // will fail if not a git repo
-    let remotes = git_repo.remotes()?;
+    let git_repo = git::get_git_repo(store)?; // will fail if not a git repo
+    let remotes = git_repo.remote_names();
 
     // case 1
     if let Some(remote) = remote {
-        if remotes.iter().any(|r| r == Some(&remote)) {
+        if remotes.iter().any(|r| r.as_ref() == BStr::new(&remote)) {
             return Ok(remote);
         }
         return Err(user_error(format!(
@@ -92,7 +93,7 @@ fn calculate_push_remote(
 
     // case 2
     if let Ok(remote) = config.get_string("gerrit.default_remote") {
-        if remotes.iter().any(|r| r == Some(&remote)) {
+        if remotes.iter().any(|r| r.as_ref() == BStr::new(&remote)) {
             return Ok(remote);
         }
         return Err(user_error(format!(
@@ -103,11 +104,11 @@ fn calculate_push_remote(
 
     // case 3
     if remotes.len() == 1 {
-        return Ok(remotes.get(0).unwrap().to_owned());
+        return Ok(remotes.first().unwrap().to_string());
     }
 
     // case 4
-    if remotes.iter().any(|r| r == Some("gerrit")) {
+    if remotes.iter().any(|r| r.as_ref() == BStr::new("gerrit")) {
         return Ok("gerrit".to_owned());
     }
 
@@ -122,10 +123,7 @@ fn calculate_push_remote(
 /// 1. If the user specifies `--for branch`, use that
 /// 2. If the user has 'gerrit.default_for' configured, use that
 /// 3. Otherwise, bail out
-fn calculate_push_ref(
-    config: &config::Config,
-    for_: Option<String>,
-) -> Result<String, CommandError> {
+fn calculate_push_ref(config: &UserSettings, for_: Option<String>) -> Result<String, CommandError> {
     // case 1
     if let Some(for_) = for_ {
         return Ok(for_);
@@ -167,11 +165,10 @@ pub fn cmd_send(ui: &mut Ui, command: &CommandHelper, send: &SendArgs) -> Result
     let base_repo = tx.base_repo().clone();
     let mut_repo = tx.repo_mut();
     let store = base_repo.store();
-    let git_repo = get_git_repo(store)?; // do this early: will fail if not a git repo
+    let git_config = command.settings().git_settings()?; // do this early: will fail if not a git repo
 
-    let for_remote =
-        calculate_push_remote(store, command.settings().config(), send.remote.clone())?;
-    let for_branch = calculate_push_ref(command.settings().config(), send.for_.clone())?;
+    let for_remote = calculate_push_remote(store, command.settings(), send.remote.clone())?;
+    let for_branch = calculate_push_ref(command.settings(), send.for_.clone())?;
 
     // immediately error and reject any discardable commits, i.e. the
     // the empty wcc
@@ -247,9 +244,9 @@ pub fn cmd_send(ui: &mut Ui, command: &CommandHelper, send: &SendArgs) -> Result
         // so that any instance of `ContentHash` can be used to generate a unique
         // id, if we ever need it.
         let mut rand_id: [u8; 32] = [0; 32];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut rand_id);
+        rand::Rng::fill(&mut rand::rng(), &mut rand_id);
 
-        let hashed_id: String = blake2b_hash(&rand_id).encode_hex();
+        let hashed_id: String = encode_hex(&blake2b_hash(&rand_id));
         let gerrit_change_id = format!("I{}", hashed_id.chars().take(40).collect::<String>());
 
         // XXX (aseipp): move this description junk for rewriting the description to
@@ -284,7 +281,7 @@ pub fn cmd_send(ui: &mut Ui, command: &CommandHelper, send: &SendArgs) -> Result
             .collect();
 
         let new_commit = mut_repo
-            .rewrite_commit(command.settings(), &original_commit)
+            .rewrite_commit(&original_commit)
             .set_description(new_description)
             .set_parents(new_parents)
             .write()?;
@@ -335,8 +332,9 @@ pub fn cmd_send(ui: &mut Ui, command: &CommandHelper, send: &SendArgs) -> Result
     let new_commits = old_to_new.values().map(|x| &x.0).collect::<Vec<&Commit>>();
     let new_heads = base_repo
         .index()
-        .heads(&mut new_commits.iter().map(|c| c.id()));
-    let remote_ref = format!("refs/for/{}", for_branch);
+        .heads(&mut new_commits.iter().map(|c| c.id()))
+        .map_err(|err| CommandError::new(crate::command_error::CommandErrorKind::Internal, err))?;
+    let remote_ref: GitRefNameBuf = format!("refs/for/{}", for_branch).into();
 
     writeln!(
         ui.stderr(),
@@ -377,19 +375,11 @@ pub fn cmd_send(ui: &mut Ui, command: &CommandHelper, send: &SendArgs) -> Result
         tx.write_commit_summary(ui.stderr_formatter().as_mut(), &head_commit)?;
         writeln!(ui.stderr())?;
 
-        // how do we get better errors from the remote? 'git push' tells us
-        // about rejected refs AND ALSO '(nothing changed)' when there are no
-        // changes to push, but we don't get that here. RefUpdateRejected might
-        // need more context, idk. is this a libgit2 problem?
-        let mut writer = GitSidebandProgressMessageWriter::new(ui);
-        let mut sideband_progress_callback = |msg: &[u8]| {
-            _ = writer.write(ui, msg);
-        };
-        with_remote_git_callbacks(ui, Some(&mut sideband_progress_callback), |cb| {
+        let stats = with_remote_git_callbacks(ui, |cb| {
             git::push_updates(
                 tx.repo_mut(),
-                &git_repo,
-                &for_remote,
+                &git_config,
+                for_remote.as_ref(),
                 &[GitRefUpdate {
                     qualified_name: remote_ref.clone(),
                     expected_current_target: None,
@@ -397,34 +387,18 @@ pub fn cmd_send(ui: &mut Ui, command: &CommandHelper, send: &SendArgs) -> Result
                 }],
                 cb,
             )
-        })
-        .map_or_else(
-            |err| match err {
-                git::GitPushError::RefUpdateRejected(_) => {
-                    // gerrit rejects ref updates when there are no changes, i.e.
-                    // you submit a change that is already up to date. just give
-                    // the user a light warning and carry on
-                    writeln!(
-                        ui.warning_default(),
-                        "warning: ref update rejected by gerrit; no changes to push (did you \
-                         forget to update, amend, or add new changes?)"
-                    )?;
+        })?;
 
-                    Ok(())
-                }
-                git::GitPushError::InternalGitError(err) => {
-                    writeln!(
-                        ui.warning_default(),
-                        "warning: internal git error while pushing to gerrit: {}",
-                        err
-                    )?;
-                    Err(user_error(err.to_string()))
-                }
-                // XXX (aseipp): more cases to handle here?
-                _ => Err(user_error(err.to_string())),
-            },
-            Ok,
-        )?;
+        if !stats.remote_rejected.is_empty() {
+            // gerrit rejects ref updates when there are no changes, i.e.
+            // you submit a change that is already up to date. just give
+            // the user a light warning and carry on
+            writeln!(
+                ui.warning_default(),
+                "warning: ref update rejected by gerrit; no changes to push (did you \
+                         forget to update, amend, or add new changes?)"
+            )?;
+        }
     }
 
     Ok(())
